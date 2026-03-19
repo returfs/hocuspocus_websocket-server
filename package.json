@@ -1,0 +1,32 @@
+{
+  "name": "hocuspocus",
+  "version": "1.0.0",
+  "description": "Hocuspocus WebSocket server for Returfs real-time collaboration",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@hocuspocus/extension-database": "^2.0.0",
+    "@hocuspocus/extension-logger": "^2.0.0",
+    "@hocuspocus/extension-webhook": "^2.0.0",
+    "@hocuspocus/server": "^2.0.0",
+    "@hocuspocus/transformer": "^2.0.0",
+    "@tiptap/extension-document": "2.7.2",
+    "@tiptap/extension-paragraph": "2.7.2",
+    "@tiptap/extension-text": "2.7.2",
+    "@tiptap/html": "^2.8.0",
+    "axios": "^1.8.4",
+    "dotenv": "^16.4.7",
+    "js-base64": "^3.7.7",
+    "yjs": "^13.6.18"
+  }
+}
