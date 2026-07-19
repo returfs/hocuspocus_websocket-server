@@ -5,85 +5,47 @@
  * Transforms between Yjs documents and plain text content.
  */
 
-import { TiptapTransformer } from '@hocuspocus/transformer';
-import Document from '@tiptap/extension-document';
-import Paragraph from '@tiptap/extension-paragraph';
-import Text from '@tiptap/extension-text';
-import { generateJSON } from '@tiptap/html';
 import axios from 'axios';
 import * as Y from 'yjs';
-import { config } from '../../config/environment';
+import { config } from '../../config/environment.js';
+import type { AuthContext } from '../documentHelpers.js';
+import { getDocumentType } from '../documentTypes.js';
 
 // Base URL for API requests
 const API_BASE_URL = config.apiUrl || 'http://project.test';
 
-/**
- * Build full URL from potentially relative path
- */
-function buildUrl(path: string): string {
-  if (path.startsWith('http://') || path.startsWith('https://')) {
-    return path;
-  }
-  // Ensure path starts with /
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return `${API_BASE_URL}${normalizedPath}`;
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-function emptyYDoc(): Y.Doc {
-  const json = {
-    type: 'doc',
-    content: [{ type: 'paragraph' }],
-  };
-
-  return TiptapTransformer.toYdoc(json, 'default', [Document, Paragraph, Text]);
-}
-
-function textDoc(text: string): Y.Doc {
-  const jsonData = generateJSON(text, [Document, Paragraph, Text]);
-  return TiptapTransformer.toYdoc(jsonData, 'default', [
-    Document,
-    Paragraph,
-    Text,
-  ]);
+/** Append the document type so Laravel resolves the right rich sidecar. */
+function withType(url: string, documentType: string): string {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}document_type=${encodeURIComponent(documentType)}`;
 }
 
 /**
- * Extract plain text from Tiptap JSON structure
+ * Resolve the resource endpoint + auth header from the connection's auth context
+ * (set by onAuthenticate). The route is built HERE from the document id — never
+ * taken from client-supplied params — so a client cannot point us at another
+ * resource. The path enforces auth: /collab is collab-token-only, /developer is
+ * rfsk_-only, each scoped to the authenticated user server-side.
  */
-function extractTextFromTiptap(json: Record<string, unknown>): string {
-  if (!json || typeof json !== 'object') return '';
-
-  const lines: string[] = [];
-
-  function processNode(node: Record<string, unknown>): string {
-    if (node.type === 'text') {
-      return (node.text as string) || '';
-    }
-    if (node.content && Array.isArray(node.content)) {
-      return node.content.map(processNode).join('');
-    }
-    return '';
+function resourceEndpoint(
+  documentName: string,
+  context: AuthContext | undefined,
+): { url: string; authHeader: string } {
+  if (context?.mode === 'collab') {
+    return {
+      url: `${API_BASE_URL}/api/v1/collab/item-instances/${documentName}/resource`,
+      authHeader: `Bearer ${context.token}`,
+    };
   }
 
-  // Handle the default fragment structure from TiptapTransformer.fromYdoc
-  const content =
-    (json.default as Record<string, unknown>)?.content ||
-    (json.content as unknown[]) ||
-    [];
-
-  for (const node of content as Record<string, unknown>[]) {
-    if (node.type === 'paragraph') {
-      lines.push(processNode(node));
-    } else {
-      lines.push(processNode(node));
-    }
+  if (context?.mode === 'developer') {
+    return {
+      url: `${API_BASE_URL}/api/v1/developer/item-instances/${documentName}/resource`,
+      authHeader: `Bearer ${context.apiKey}`,
+    };
   }
 
-  return lines.join('\n');
+  throw new Error('No authentication context for resource access');
 }
 
 // ============================================================================
@@ -92,7 +54,11 @@ function extractTextFromTiptap(json: Record<string, unknown>): string {
 
 interface FetchDocumentParams {
   documentName: string;
-  requestParameters: Map<string, string>;
+  // Hocuspocus passes connection params as URLSearchParams (not a Map). Both
+  // expose .get(key), but the types must match the @hocuspocus/server payload.
+  requestParameters: URLSearchParams;
+  // Auth context from onAuthenticate (collab token or dev rfsk_ key).
+  context?: AuthContext;
 }
 
 /**
@@ -104,31 +70,24 @@ interface FetchDocumentParams {
 export const fetchDocument = async ({
   documentName,
   requestParameters,
+  context,
 }: FetchDocumentParams): Promise<Uint8Array> => {
-  const resourceRoute = requestParameters.get('resourceRoute');
-  const apiKey = requestParameters.get('apiKey');
+  const documentType = getDocumentType(requestParameters.get('documentType'));
+  const endpoint = resourceEndpoint(documentName, context);
 
   console.log('[Hocuspocus] fetchDocument:', {
     documentName,
-    resourceRoute,
-    hasApiKey: !!apiKey,
+    mode: context?.mode,
+    documentType: documentType.id,
   });
-
-  if (!resourceRoute) {
-    throw new Error('No resource route provided');
-  }
 
   try {
     const headers: Record<string, string> = {
       Accept: 'application/json',
+      Authorization: endpoint.authHeader,
     };
 
-    // Include API key for developer authentication (Bearer token format)
-    if (apiKey) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
-    }
-
-    const fullUrl = buildUrl(resourceRoute);
+    const fullUrl = withType(endpoint.url, documentType.id);
     console.log('[Hocuspocus] Fetching from:', fullUrl);
 
     const response = await axios.get(fullUrl, { headers });
@@ -142,22 +101,31 @@ export const fetchDocument = async ({
       encoding: item?.encoding,
     });
 
-    // Handle base64 encoded content (developer API format)
+    // Rich sidecar (.rtxt = Yjs document state). Full fidelity, restored with
+    // NO server-side schema — apply the stored Yjs update directly. Preferred
+    // over the plain content when present.
+    if (item?.rich) {
+      console.log('[Hocuspocus] Restoring rich Yjs state from sidecar');
+      return new Uint8Array(Buffer.from(item.rich, 'base64'));
+    }
+
+    // Handle base64 encoded content (developer API format) — plain fallback for
+    // files never edited in the editor (no sidecar yet).
     if (item?.content && item?.encoding === 'base64') {
       const plainText = Buffer.from(item.content, 'base64').toString('utf-8');
       console.log('[Hocuspocus] Decoded text:', plainText.length, 'chars');
-      return Y.encodeStateAsUpdate(textDoc(plainText));
+      return Y.encodeStateAsUpdate(documentType.hydrate(plainText));
     }
 
     // Handle plain string content
     if (typeof item?.content === 'string') {
-      return Y.encodeStateAsUpdate(textDoc(item.content));
+      return Y.encodeStateAsUpdate(documentType.hydrate(item.content));
     }
 
     // Handle legacy resource response
     const resourceData = data?.item?.resource ?? data?.resource ?? data;
     if (typeof resourceData === 'string' && resourceData) {
-      return Y.encodeStateAsUpdate(textDoc(resourceData));
+      return Y.encodeStateAsUpdate(documentType.hydrate(resourceData));
     }
 
     // Handle raw bytes
@@ -165,11 +133,23 @@ export const fetchDocument = async ({
       return new Uint8Array(resourceData.data);
     }
 
-    console.log('[Hocuspocus] Returning empty document');
-    return Y.encodeStateAsUpdate(emptyYDoc());
+    // A 2xx response with no content means a genuinely empty file — safe to
+    // start from an empty document.
+    console.log('[Hocuspocus] No content in response; starting empty document');
+    return Y.encodeStateAsUpdate(documentType.empty());
   } catch (error) {
-    console.error('[Hocuspocus] Fetch error:', error);
-    return Y.encodeStateAsUpdate(emptyYDoc());
+    // DATA-LOSS SAFETY: a load FAILURE (network error, 401/403/404/500) must NOT
+    // silently seed an empty document — otherwise the user sees a blank editor,
+    // edits it, and storeDocument overwrites the real file with empty content.
+    // Re-throw so Hocuspocus fails the document load and the client shows a
+    // connection error instead of a destructive blank state.
+    console.error(
+      '[Hocuspocus] Fetch FAILED — refusing to seed empty doc:',
+      error,
+    );
+    throw error instanceof Error
+      ? error
+      : new Error('Failed to load document content');
   }
 };
 
@@ -180,7 +160,10 @@ export const fetchDocument = async ({
 interface StoreDocumentParams {
   document: Y.Doc;
   documentName: string;
-  requestParameters: Map<string, string>;
+  // See FetchDocumentParams: Hocuspocus supplies URLSearchParams here.
+  requestParameters: URLSearchParams;
+  // Auth context from onAuthenticate (collab token or dev rfsk_ key).
+  context?: AuthContext;
 }
 
 /**
@@ -193,48 +176,70 @@ export const storeDocument = async ({
   document,
   documentName,
   requestParameters,
+  context,
 }: StoreDocumentParams): Promise<void> => {
-  const resourceUpdateRoute = requestParameters.get('resourceUpdateRoute');
-  const apiKey = requestParameters.get('apiKey');
+  const documentType = getDocumentType(requestParameters.get('documentType'));
 
-  console.log('[Hocuspocus] storeDocument:', {
-    documentName,
-    resourceUpdateRoute,
-    hasApiKey: !!apiKey,
-  });
-
-  if (!resourceUpdateRoute) {
-    console.error('[Hocuspocus] No update route provided');
+  // A read-only collab connection must never persist — defence in depth (the
+  // /collab PUT route also rejects read tokens, and Hocuspocus marks the
+  // connection readOnly, but never even attempt the write here).
+  if (context?.mode === 'collab' && context.perms !== 'write') {
+    console.warn('[Hocuspocus] Skipping store — read-only connection');
     return;
   }
 
-  // Convert Yjs document to JSON, then extract plain text
-  const documentJson = TiptapTransformer.fromYdoc(document) as Record<
-    string,
-    unknown
-  >;
-  const plainText = extractTextFromTiptap(documentJson);
+  let endpoint: { url: string; authHeader: string };
+  try {
+    endpoint = resourceEndpoint(documentName, context);
+  } catch (e) {
+    console.error('[Hocuspocus] No auth context for store — skipping', e);
+    return;
+  }
+
+  console.log('[Hocuspocus] storeDocument:', {
+    documentName,
+    mode: context?.mode,
+    documentType: documentType.id,
+  });
+
+  // Plain export: flatten the Yjs document per its document type (no full schema
+  // needed to read the Yjs fragments). This is the portable export content.
+  const plainText = documentType.flatten(document);
   const base64Content = Buffer.from(plainText, 'utf-8').toString('base64');
 
-  console.log('[Hocuspocus] Storing:', plainText.length, 'chars');
+  // Rich sidecar: the full Yjs document state (base64). Restores full fidelity
+  // + collab history on next open, with no server-side schema.
+  const richState = Y.encodeStateAsUpdate(document);
+  const base64Rich = Buffer.from(richState).toString('base64');
+
+  console.log(
+    '[Hocuspocus] Storing:',
+    plainText.length,
+    'chars text,',
+    richState.length,
+    'bytes rich',
+  );
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
+    Authorization: endpoint.authHeader,
   };
 
-  // Include API key for developer authentication (Bearer token format)
-  if (apiKey) {
-    headers['Authorization'] = `Bearer ${apiKey}`;
-  }
-
   try {
-    const fullUrl = buildUrl(resourceUpdateRoute);
+    const fullUrl = endpoint.url;
     console.log('[Hocuspocus] Storing to:', fullUrl);
 
     const response = await axios.put(
       fullUrl,
-      { content: base64Content },
+      // encoding:'base64' is REQUIRED — without it the API stores the base64
+      // string verbatim instead of decoding it (file corruption).
+      {
+        content: base64Content,
+        encoding: 'base64',
+        rich: base64Rich,
+        document_type: documentType.id,
+      },
       { headers },
     );
     console.log('[Hocuspocus] Store successful:', response.status);

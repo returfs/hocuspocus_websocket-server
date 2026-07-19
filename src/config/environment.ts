@@ -10,4 +10,7 @@ export const config = {
   debug: process.env.APP_DEBUG === 'true',
   apiUrl: process.env.RETURFS_API_URL || 'http://project.test',
   apiKey: process.env.RETURFS_API_KEY,
+  // Shared HMAC secret for verifying per-user collaboration tokens. MUST match
+  // the Laravel app's HOCUSPOCUS_SECRET (config services.hocuspocus.secret).
+  collabSecret: process.env.HOCUSPOCUS_SECRET,
 };
