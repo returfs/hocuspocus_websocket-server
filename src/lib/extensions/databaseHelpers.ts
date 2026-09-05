@@ -7,12 +7,13 @@
 
 import axios from 'axios';
 import * as Y from 'yjs';
+import { api } from '../apiClient.js';
 import { config } from '../../config/environment.js';
 import type { AuthContext } from '../documentHelpers.js';
 import { getDocumentType } from '../documentTypes.js';
 
 // Base URL for API requests
-const API_BASE_URL = config.apiUrl || 'http://project.test';
+const API_BASE_URL = config.apiUrl || 'https://project.test';
 
 /** Append the document type so Laravel resolves the right rich sidecar. */
 function withType(url: string, documentType: string): string {
@@ -22,8 +23,8 @@ function withType(url: string, documentType: string): string {
 
 /**
  * Resolve the resource endpoint + auth header from the connection's auth context
- * (set by onAuthenticate). The route is built HERE from the document id — never
- * taken from client-supplied params — so a client cannot point us at another
+ * (set by onAuthenticate). The route is built HERE from the document id, never
+ * taken from client-supplied params, so a client cannot point us at another
  * resource. The path enforces auth: /collab is collab-token-only, /developer is
  * rfsk_-only, each scoped to the authenticated user server-side.
  */
@@ -73,6 +74,18 @@ export const fetchDocument = async ({
   context,
 }: FetchDocumentParams): Promise<Uint8Array> => {
   const documentType = getDocumentType(requestParameters.get('documentType'));
+
+  // Transport-only types (word): the server never reads the resource; the
+  // room starts empty and the first peer seeds it from the file client-side.
+  // Auth has already run (onAuthenticate), so this is not a bypass.
+  if (documentType.transportOnly) {
+    console.log('[Hocuspocus] fetchDocument (transport-only, empty room):', {
+      documentName,
+      documentType: documentType.id,
+    });
+    return Y.encodeStateAsUpdate(documentType.empty());
+  }
+
   const endpoint = resourceEndpoint(documentName, context);
 
   console.log('[Hocuspocus] fetchDocument:', {
@@ -90,7 +103,7 @@ export const fetchDocument = async ({
     const fullUrl = withType(endpoint.url, documentType.id);
     console.log('[Hocuspocus] Fetching from:', fullUrl);
 
-    const response = await axios.get(fullUrl, { headers });
+    const response = await api.get(fullUrl, { headers });
     const data = response.data;
     const item = data?.data?.item || data?.item;
 
@@ -102,14 +115,14 @@ export const fetchDocument = async ({
     });
 
     // Rich sidecar (.rtxt = Yjs document state). Full fidelity, restored with
-    // NO server-side schema — apply the stored Yjs update directly. Preferred
+    // NO server-side schema; apply the stored Yjs update directly. Preferred
     // over the plain content when present.
     if (item?.rich) {
       console.log('[Hocuspocus] Restoring rich Yjs state from sidecar');
       return new Uint8Array(Buffer.from(item.rich, 'base64'));
     }
 
-    // Handle base64 encoded content (developer API format) — plain fallback for
+    // Handle base64 encoded content (developer API format); plain fallback for
     // files never edited in the editor (no sidecar yet).
     if (item?.content && item?.encoding === 'base64') {
       const plainText = Buffer.from(item.content, 'base64').toString('utf-8');
@@ -133,18 +146,18 @@ export const fetchDocument = async ({
       return new Uint8Array(resourceData.data);
     }
 
-    // A 2xx response with no content means a genuinely empty file — safe to
+    // A 2xx response with no content means a genuinely empty file; safe to
     // start from an empty document.
     console.log('[Hocuspocus] No content in response; starting empty document');
     return Y.encodeStateAsUpdate(documentType.empty());
   } catch (error) {
     // DATA-LOSS SAFETY: a load FAILURE (network error, 401/403/404/500) must NOT
-    // silently seed an empty document — otherwise the user sees a blank editor,
+    // silently seed an empty document; otherwise the user sees a blank editor,
     // edits it, and storeDocument overwrites the real file with empty content.
     // Re-throw so Hocuspocus fails the document load and the client shows a
     // connection error instead of a destructive blank state.
     console.error(
-      '[Hocuspocus] Fetch FAILED — refusing to seed empty doc:',
+      '[Hocuspocus] Fetch FAILED; refusing to seed empty doc:',
       error,
     );
     throw error instanceof Error
@@ -180,11 +193,18 @@ export const storeDocument = async ({
 }: StoreDocumentParams): Promise<void> => {
   const documentType = getDocumentType(requestParameters.get('documentType'));
 
-  // A read-only collab connection must never persist — defence in depth (the
+  // Transport-only types persist client-side (the typing peer exports the
+  // file and writes the rich sidecar through the session API); storing the
+  // flattened doc here would corrupt a binary format with an empty string.
+  if (documentType.transportOnly) {
+    return;
+  }
+
+  // A read-only collab connection must never persist; defence in depth (the
   // /collab PUT route also rejects read tokens, and Hocuspocus marks the
   // connection readOnly, but never even attempt the write here).
   if (context?.mode === 'collab' && context.perms !== 'write') {
-    console.warn('[Hocuspocus] Skipping store — read-only connection');
+    console.warn('[Hocuspocus] Skipping store; read-only connection');
     return;
   }
 
@@ -192,7 +212,7 @@ export const storeDocument = async ({
   try {
     endpoint = resourceEndpoint(documentName, context);
   } catch (e) {
-    console.error('[Hocuspocus] No auth context for store — skipping', e);
+    console.error('[Hocuspocus] No auth context for store; skipping', e);
     return;
   }
 
@@ -230,9 +250,9 @@ export const storeDocument = async ({
     const fullUrl = endpoint.url;
     console.log('[Hocuspocus] Storing to:', fullUrl);
 
-    const response = await axios.put(
+    const response = await api.put(
       fullUrl,
-      // encoding:'base64' is REQUIRED — without it the API stores the base64
+      // encoding:'base64' is REQUIRED; without it the API stores the base64
       // string verbatim instead of decoding it (file corruption).
       {
         content: base64Content,
